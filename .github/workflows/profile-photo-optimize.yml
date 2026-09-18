@@ -1,0 +1,86 @@
+name: One-time V-POINTS profile photo optimization
+
+on:
+  push:
+    paths:
+      - '.github/workflows/profile-photo-optimize.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-home:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch V-POINTS photo handling
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('home.html')
+          s=p.read_text(encoding='utf-8')
+
+          old='''<div class="photoNote">Profile photo • JPG/PNG/WEBP • max 2 MB. You can also add/change it later by tapping the employee photo.</div>'''
+          new='''<div class="photoNote">Profile photo is automatically center-cropped to a square, resized to 256×256 px (about 2.2 cm at 300 dpi), converted to WebP when supported, and compressed for fast loading. You can change it later by tapping the employee photo.</div>'''
+          if old not in s:
+              raise SystemExit('photo note target not found')
+          s=s.replace(old,new,1)
+
+          old='''const pic=p.photo_url?`<img src="${esc(p.photo_url)}" alt="">`:esc(initials(p.full_name));'''
+          new='''const pic=p.photo_url?`<img src="${esc(p.photo_url)}" alt="" loading="lazy" decoding="async">`:esc(initials(p.full_name));'''
+          if old not in s:
+              raise SystemExit('avatar target not found')
+          s=s.replace(old,new,1)
+
+          marker="""async function filePayload(file,max=5242880,imagesOnly=false){if(!file)throw Error('File is required.');if(file.size>max)throw Error('File is too large.');const allowed=imagesOnly?['image/jpeg','image/png','image/webp']:['image/jpeg','image/png','image/webp','application/pdf'];if(!allowed.includes(file.type))throw Error('File type is not allowed.');const b64=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(String(fr.result).split(',')[1]);fr.onerror=rej;fr.readAsDataURL(file)});return{file_name:file.name,file_type:file.type,file_base64:b64}}"""
+          optimizer="""
+async function optimizedPhotoPayload(file){
+ if(!file)throw Error('Profile photo is required.');
+ if(!['image/jpeg','image/png','image/webp'].includes(file.type))throw Error('Profile photo must be JPG, PNG or WEBP.');
+ if(file.size>15*1024*1024)throw Error('Please choose a photo smaller than 15 MB.');
+ const url=URL.createObjectURL(file);
+ let img;
+ try{img=await new Promise((res,rej)=>{const i=new Image();i.onload=()=>res(i);i.onerror=()=>rej(Error('Unable to read this photo.'));i.src=url})}finally{}
+ const side=Math.min(img.naturalWidth||img.width,img.naturalHeight||img.height),sx=((img.naturalWidth||img.width)-side)/2,sy=((img.naturalHeight||img.height)-side)/2;
+ const canvas=document.createElement('canvas');canvas.width=256;canvas.height=256;const ctx=canvas.getContext('2d',{alpha:false});ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';ctx.drawImage(img,sx,sy,side,side,0,0,256,256);URL.revokeObjectURL(url);
+ const make=(type,q)=>new Promise(res=>canvas.toBlob(res,type,q));
+ let type='image/webp',quality=.82,blob=await make(type,quality);
+ if(!blob||blob.type!=='image/webp'){type='image/jpeg';quality=.82;blob=await make(type,quality)}
+ while(blob&&blob.size>100*1024&&quality>.46){quality-=.08;blob=await make(type,quality)}
+ if(!blob)throw Error('Unable to optimize this photo.');
+ if(blob.size>150*1024)throw Error('Unable to compress photo below 150 KB. Please use a simpler photo.');
+ const b64=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(String(fr.result).split(',')[1]);fr.onerror=rej;fr.readAsDataURL(blob)});
+ return{file_name:type==='image/webp'?'profile-256.webp':'profile-256.jpg',file_type:type,file_base64:b64};
+}
+"""
+          if marker not in s:
+              raise SystemExit('filePayload target not found')
+          s=s.replace(marker,marker+optimizer,1)
+
+          old="""const payload=await filePayload(f,2097152,true);"""
+          new="""const payload=await optimizedPhotoPayload(f);"""
+          if old not in s:
+              raise SystemExit('change photo target not found')
+          s=s.replace(old,new,1)
+
+          old="""Object.assign(body,await filePayload($('profilePhoto').files[0],2097152,true))"""
+          new="""Object.assign(body,await optimizedPhotoPayload($('profilePhoto').files[0]))"""
+          if old not in s:
+              raise SystemExit('new profile photo target not found')
+          s=s.replace(old,new,1)
+
+          p.write_text(s,encoding='utf-8')
+          PY
+      - name: Commit optimized profile photo flow
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No changes needed"
+            exit 0
+          fi
+          git config user.name "V-POINTS Automation"
+          git config user.email "actions@users.noreply.github.com"
+          git add home.html
+          git commit -m "Optimize employee profile photos for faster loading"
+          git push
